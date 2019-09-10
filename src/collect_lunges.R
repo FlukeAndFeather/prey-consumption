@@ -11,6 +11,26 @@ dn_to_posix <- function(dn) {
   as.POSIXct((dn - 719529) * 86400, origin = "1970-01-01", tz = "UTC")
 }
 
+# Regex patterns for tag-type IDs
+cats_ID <- "[a-z]{2}[0-9]{6}-[0-9]{1,2}[a-z]?"
+dtag_ID <- "[a-z]{2}[0-9]{2}_[0-9]{1,3}[a-z]"
+acou_ID <- "[a-z]{2}[0-9]{6}"
+
+# Verified lunges
+valid_deployments <- read_csv("data/lunge_rates_from_Paolo.csv") %>% 
+  filter(lunge_quality %in% c("good", "good dives", "good_dives"), 
+         sonar_exp == "none",
+         species %in% c("ba", "bp", "bw", "mn"),
+         total_lunges > 0) %>% 
+  mutate(tag_type = case_when(str_detect(ID, cats_ID) ~ "CATS",
+                              str_detect(ID, dtag_ID) ~ "DTAG",
+                              str_detect(ID, acou_ID) ~ "ACOU"),
+         species = recode(species, ba = "bb"))
+
+# CATS tag guide
+tag_guide <- readxl::read_xlsx("/Volumes/COPYCATSdat/CATS/TAG GUIDE.xlsx", skip = 2) %>% 
+  mutate(tag_tz = sprintf("Etc/GMT%+d", `UTC         _`))
+
 # What are the day/night feeding rates?
 # Look up PRH & lunge file paths on the CATS drive
 # This will look different on Windows
@@ -48,9 +68,8 @@ find_dtag_data <- function(id) {
 # with lunge times.d
 lunge_times_cats <- function(data, key) {
   id <- key$ID
+  tag_tz <- key$tag_tz
   data_paths <- find_cats_data(id)
-  tag_guide <- readxl::read_xlsx("/Volumes/COPYCATSdat/CATS/TAG GUIDE.xlsx", skip = 2)
-  tag_tz <- sprintf("Etc/GMT%+d", -filter(tag_guide, ID == id)$`UTC         _`)
   tryCatch({
     c(prh, lunges) %<-% map(data_paths, readMat)
     tibble(lunge_dt = dn_to_posix(prh$DN[lunges$LungeI]) %>% 
@@ -75,44 +94,29 @@ lunge_times_dtag <- function(data, key) {
 # with two columns (tagon and tagoff).
 tag_times_cats <- function(data, key) {
   id <- key$ID
+  tag_tz <- key$tag_tz
   data_paths <- find_cats_data(id)
   tryCatch({
-    # Read time zone from tag guide
-    tag_guide <- readxl::read_xlsx("/Volumes/COPYCATSdat/CATS/TAG GUIDE.xlsx", skip = 2)
-    tag_tz <- sprintf("Etc/GMT%+d", -filter(tag_guide, ID == id)$`UTC         _`)
     prh <- readMat(data_paths$prh_path)
     tagonoff_prh <- dn_to_posix(range(prh$DN[prh$tagon == 1])) %>% 
       force_tz(tag_tz)
-    # Tag_On seems to read correctly, but Tag_Off comes across as a serial
-    tagonoff_guide <- filter(tag_guide, ID == id)$Tag_On %>% 
-      force_tz(tag_tz)
-    tagonoff_guide[2] <- filter(tag_guide, ID == id)$Tag_Off %>% 
-      openxlsx::convertToDateTime(tz = tag_tz)
-    tibble(tagon_prh = tagonoff_prh[1],
-           tagoff_prh = tagonoff_prh[2],
-           tagon_guide = tagonoff_guide[1],
-           tagoff_guide = tagonoff_guide[2])
-  }, error = function(e) tibble(tagon_prh = NA,
-                                tagoff_prh = NA,
-                                tagon_guide = NA,
-                                tagoff_guide = NA))
+    tibble(tagon = tagonoff_prh[1],
+           tagoff = tagonoff_prh[2])
+  }, error = function(e) tibble(tagon = NA,
+                                tagoff = NA))
 }
 
 # Deployment metadata. Starts with Paolo's lunge rate file. Filters down to
 # good quality dives and the four rorqual species of interest. Removes sonar
 # exposure deployments. Gets tag on/off times.
-deployments_cats <- read_csv("data/lunge_rates_from_Paolo.csv") %>% 
-  filter(lunge_quality %in% c("good", "good dives", "good_dives"), 
-         sonar_exp == "none",
-         species %in% c("ba", "bp", "bw", "mn")) %>% 
+deployments_cats <- valid_deployments %>% 
+  filter(tag_type == "CATS") %>% 
+  left_join(select(tag_guide, ID, tag_tz), by = "ID") %>% 
   # One incorrect ID
-  mutate(ID = if_else(ID == "mn161106-36",
-                      "mn161106-36b",
-                      ID)) %>% 
-  group_by(species, ID) %>% 
+  mutate(ID = recode(ID, `mn161106-36` = "mn161106-36b")) %>% 
+  group_by(ID, tag_tz) %>% 
   group_map(tag_times_cats) %>% 
-  ungroup %>% 
-  filter(str_length(ID) >= 11)
+  ungroup
 
 deployments_dtag <- read_xlsx("data/DTag data_fixesforMFC.xlsx", 
                               col_types = c("text", "date", "date", "numeric", 
@@ -120,6 +124,10 @@ deployments_dtag <- read_xlsx("data/DTag data_fixesforMFC.xlsx",
                                             "numeric", "text", "text", 
                                             "text")) %>% 
   drop_na(ID, Lat, Long) %>%
+  # Filter down to good quality lunges
+  semi_join(valid_deployments %>% 
+              filter(tag_type == "DTAG"),
+            by = "ID") %>% 
   mutate(species = substr(ID, 1, 2),
          deploy_tz = tz_lookup_coords(lat = Lat, lon = Long, method = "accurate"),
          tagon = force_tzs(`Tag on`, deploy_tz),

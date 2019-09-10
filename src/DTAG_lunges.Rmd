@@ -1,0 +1,324 @@
+---
+title: "DTAG lunges"
+output:
+  html_document:
+    df_print: paged
+---
+
+Lunge rates of tagged whales by species, region, and prey type from DTAG (plus a couple Acousondes) data.
+
+```{r setup, echo = FALSE, message = FALSE}
+library(datetimeutils)
+library(ggpubr)
+library(kableExtra)
+library(knitr)
+library(lubridate)
+library(lutz)
+library(oce)
+library(R.matlab)
+library(readxl)
+library(RcppRoll)
+# Using the dev version of tidyr to use unnest_wider and unnest_longer
+library(tidyverse)
+library(zeallot)
+
+opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+opts_chunk$set(echo = FALSE, message = FALSE, cache = TRUE)
+```
+
+# Tag guide summary
+
+```{r util}
+# Convert MATLAB DN's to POSIXct
+dn_to_posix <- function(dn) {
+  as.POSIXct((dn - 719529) * 86400, origin = "1970-01-01", tz = "UTC")
+}
+
+# Regex patterns for tag-type IDs
+cats_ID <- "[a-z]{2}[0-9]{6}-[0-9]{1,2}[a-z]?"
+dtag_ID <- "[a-z]{2}[0-9]{2}_[0-9]{1,3}[a-z]"
+acou_ID <- "[a-z]{2}[0-9]{6}[a-z]?"
+parse_tagtype <- function(id) {
+  case_when(str_detect(id, cats_ID) ~ "CATS",
+            str_detect(id, dtag_ID) ~ "DTAG",
+            str_detect(id, acou_ID) ~ "ACOU",
+            TRUE ~ "UNKTAG")
+}
+
+POSIX_from_excel <- function(datenum) {
+  convert_date(parse_number(datenum), "excel", fraction = TRUE, tz = "UTC")
+}
+
+find_prh <- function(id, tag) {
+  prh_dir <- case_when(tag == "ACOU" ~ "/Volumes/COPYCATSdat/ACOU/prh",
+                       tag == "DTAG" ~ "/Volumes/COPYCATSdat/DTAG/prh",
+                       TRUE ~ "~")
+  map2_chr(prh_dir, id, function(.x, .y) {
+    result <- dir(.x, pattern = .y, full.names = TRUE)
+    if (length(result) == 0) NA_character_
+    else if (length(result) == 1) result
+    else "MULTIPLE"
+  })
+}
+
+find_lunge <- function(id, tag) {
+  lunge_dir <- case_when(tag == "ACOU" ~ "/Volumes/COPYCATSdat/ACOU/lunges",
+                         tag == "DTAG" ~ "/Volumes/COPYCATSdat/DTAG/lunges",
+                         TRUE ~ "~")
+  map2_chr(lunge_dir, id, function(.x, .y) {
+    result <- dir(.x, pattern = .y, full.names = TRUE)
+    if (length(result) == 0) NA_character_
+    else if (length(result) == 1) result
+    else "MULTIPLE"
+  })
+}
+
+find_tz <- function(lon, lat) {
+  tz_lookup_coords(lat, lon, "fast", FALSE)
+}
+
+force_tzs2 <- function(time, tzones, tzone_out = "UTC") {
+  result_list <- map2(time, tzones, function(.x, .y) {
+    tryCatch(force_tzs(.x, .y, tzone_out), error = function(e) NA)
+  })
+  result_vec <- unlist(result_list)
+  attributes(result_vec) <- attributes(result_list[[1]])
+  result_vec
+}
+```
+
+```{r solar}
+sun_phase <- function(x, y, t) {
+  alt <- pmap_dbl(list(x, y, t), function(x, y, t) {
+    if (any(is.na(c(x, y, t)))) {
+      NA
+    } else {
+      alt <- sunAngle(t, longitude = x, latitude = y)$altitude
+    }
+  })
+  cut(alt, c(-Inf, -18, 0, Inf), labels = c("NIGHT", "TWILIGHT", "DAY"))
+}
+
+daylight_fun <- function(start, end, lon, lat, n = 1e3) {
+  pmap_dbl(list(start, end, lon, lat), function(start, end, lon, lat) {
+    if (any(is.na(c(start, end, lon, lat)))) {
+      NA
+    } else {
+      angle <- sunAngle(seq(start, end, length.out = n), lon, lat)$altitude 
+      as.numeric(end - start, units = "hours") * sum(angle > 0) / n
+    }
+  })
+}
+twilight_fun <- function(start, end, lon, lat, n = 1e3) {
+  pmap_dbl(list(start, end, lon, lat), function(start, end, lon, lat) {
+    if (any(is.na(c(start, end, lon, lat)))) {
+      NA
+    } else {
+      angle <- sunAngle(seq(start, end, length.out = n), lon, lat)$altitude 
+      as.numeric(end - start, units = "hours") * sum(angle >= -18 & angle <= 0) / n
+    }
+  })
+}
+night_fun <- function(start, end, lon, lat, n = 1e3) {
+  pmap_dbl(list(start, end, lon, lat), function(start, end, lon, lat) {
+    if (any(is.na(c(start, end, lon, lat)))) {
+      NA
+    } else {
+      angle <- sunAngle(seq(start, end, length.out = n), lon, lat)$altitude 
+      as.numeric(end - start, units = "hours") * sum(angle < -18) / n
+    }
+  })
+}
+```
+
+```{r deployments}
+deployments <- read_xlsx("data/DTag data_fixesforMFC.xlsx") %>% 
+  transmute(ID, 
+            species = str_sub(ID, 1, 2), 
+            longitude = Long,
+            latitude = Lat,
+            sonar_exp = case_when(sonar_exp %in% c("yes", "PRN") ~ TRUE,
+                                  sonar_exp %in% c("none", "NA") ~ FALSE),
+            prh_exists = case_when(`prh file found` == "Y" ~ TRUE,
+                                   is.na(`prh file found`) ~ FALSE),
+            lunge_exists = case_when(`lunge file found` == "Y" ~ TRUE,
+                                     is.na(`lunge file found`) ~ FALSE,
+                                     `lunge file found` == "N" ~ FALSE),
+            tag_type = parse_tagtype(ID),
+            prh_path = find_prh(ID, tag_type),
+            lunge_path = find_lunge(ID, tag_type),
+            tag_tz = find_tz(longitude, latitude),
+            tagon = force_tzs2(POSIX_from_excel(`Tag on`), tag_tz),
+            tagoff = force_tzs2(POSIX_from_excel(`Tag off`), tag_tz),
+            duration_h = as.numeric(tagoff - tagon, unit = "hours"), 
+            daylight_h = daylight_fun(tagon, tagoff, longitude, latitude),
+            night_h = night_fun(tagon, tagoff, longitude, latitude),
+            twilight_h = twilight_fun(tagon, tagoff, longitude, latitude))
+```
+
+We have two minkes with an indecipherable tag type. There's a total of 26 fins. 23/24 fin DTAGs have PRHs and lunges. Data for the two Acousonde fins are on the shared drive and should be added (several days of data). Probably a similar story for the six blue whale Acousondes. 67 blue whale DTAGs!
+
+```{r deployment_summ}
+deployments %>% 
+  group_by(species, tag_type) %>% 
+  summarize(N = n(),
+            Nprh = sum(prh_exists),
+            Nlunge = sum(lunge_exists))
+```
+
+```{r lunge_times}
+lunge_times <- function(prh_path, lunge_path) {
+  if (any(is.na(c(prh_path, lunge_path))))
+    return(NA)
+  lunge_mat <- readMat(lunge_path)
+  # If dates aren't in the lunge file, use PRH to look up by index
+  if (is.null(lunge_mat$LungeDN)) {
+    prh_mat <- readMat(prh_path)
+    dn <- prh_mat$DN[lunge_mat$LungeI]
+  } else {
+    dn <- lunge_mat$LungeDN
+  }
+  dn_to_posix(dn)
+}
+
+lunges <- deployments %>%
+  mutate(lunge_time = map2(prh_path, lunge_path, lunge_times)) %>% 
+  unnest(lunge_time) %>%
+  mutate(lunge_time = force_tzs2(lunge_time, tag_tz),
+         lunge_sun = sun_phase(x = longitude, y = latitude, t = lunge_time)) %>% 
+  select(ID, species, lunge_time, lunge_sun) %>% 
+  drop_na()
+
+save(lunges, file = "data/outputs/DTAG_lunges/lunges.RData")
+```
+
+```{r rates}
+lunges_deploy <- lunges %>% 
+  group_by(ID) %>% 
+  summarize(total_lunges = n(),
+            day_lunges = sum(lunge_sun == "DAY"),
+            twilight_lunges = sum(lunge_sun == "TWILIGHT"),
+            night_lunges = sum(lunge_sun == "NIGHT")) %>% 
+  left_join(select(deployments, ID, species,
+                   total_hours = duration_h,
+                   day_hours = daylight_h,
+                   night_hours = night_h),
+            by = "ID")
+```
+
+```{r qa_lungerates}
+lunge_rate_by_solar <- function(rows, keys) {
+  c(p, rates) %<-% tryCatch({
+    prh <- readMat(rows$prh_path[1])
+    if (is.null(prh$DN)) {
+      DN <- first(rows$tagon) + 1:nrow(prh$A) / prh$fs[1]
+    } else {
+      DN <- force_tz(dn_to_posix(prh$DN), rows$tag_tz[1]) %>% 
+        with_tz("UTC")
+    }
+    speed_path <- dir('data/speeds', keys$ID, full.names = TRUE)
+    if (length(speed_path) == 1) {
+      speed <- speed_path %>% 
+      readLines %>% 
+      parse_number %>% 
+      roll_mean(n = 10, fill = NA)
+    } else {
+      speed <- rep(NA, length(DN))
+    }
+    lon <- mean(rows$longitude)
+    lat <- mean(rows$latitude)
+    n_hours <- 6
+    prh_data <- tibble(datetime = with_tz(DN, rows$tag_tz[1]),
+                       depth = prh$p,
+                       speed) %>% 
+      slice(seq(1, length(DN), length.out = 1e4)) %>% 
+      mutate(sunalt = sunAngle(datetime, lon, lat)$altitude)
+    rows2 <- mutate(rows, 
+                    datetime = lunge_time,
+                    i = findInterval(lunge_time, prh_data$datetime),
+                    depth = prh_data$depth[i],
+                    speed = prh_data$speed[i])
+    solar <- prh_data %>% 
+      mutate(phase = case_when(sunalt < -18 ~ "NIGHT",
+                               sunalt < 0   ~ "TWILIGHT",
+                               sunalt >= 0  ~ "DAY") %>% 
+               factor(levels = c("NIGHT", "TWILIGHT", "DAY")),
+             phaseid = cumsum(phase != lag(phase, default = first(phase)))) %>% 
+      group_by(phase, phaseid) %>% 
+      summarize(start = first(datetime)) %>% 
+      ungroup %>% 
+      arrange(phaseid) %>% 
+      mutate(end = lead(start, default = last(prh_data$datetime)))
+    solarpal <- c(DAY = rgb(86, 180, 233, maxColorValue = 255), # sky blue
+                  TWILIGHT = rgb(213, 94, 0, maxColorValue = 255), # vermillion
+                  NIGHT = rgb(0, 158, 115, maxColorValue = 255)) # bluish green
+    depth_plot <- ggplot(prh_data, aes(datetime, depth)) +
+      geom_rect(aes(xmin = start, 
+                    xmax = end, 
+                    ymin = min(prh_data$depth, na.rm = TRUE),
+                    ymax = max(prh_data$depth, na.rm = TRUE),
+                    fill = phase),
+                data = solar,
+                alpha = 0.5,
+                inherit.aes = FALSE) +
+      geom_line(size = 0.1) +
+      geom_point(data = rows2, color = "red") +
+      scale_y_reverse() +
+      scale_fill_manual(values = solarpal) +
+      labs(title = keys$ID,
+           y = "Depth (m)") +
+      theme_classic() +
+      theme(legend.position = "none",
+            axis.title.x = element_blank(),
+            axis.text.x = element_blank())
+    speed_plot <- ggplot(prh_data, aes(datetime, speed)) +
+      geom_line(size = 0.1) +
+      geom_point(data = rows2, color = "red") +
+      labs(x = "Local time",
+           y = "Speed (m/s)") +
+      theme_classic() +
+      theme(legend.position = "none")
+    lunging <- summarize(rows, 
+                         l = n(),
+                         ld = sum(lunge_sun == "DAY"),
+                         ln = sum(lunge_sun == "NIGHT"),
+                         lt = sum(lunge_sun == "TWILIGHT")) %>% 
+      gather(lvar, Lunges, l:lt)
+    durs <- tibble(t = rows$duration_h[1],
+                   td = rows$daylight_h[1],
+                   tn = rows$night_h[1],
+                   tt = rows$twilight_h[1]) %>% 
+      gather(tvar, Time, t:tt)
+    rates <- cbind(lunging, durs) %>% 
+      mutate(Rate = Lunges / Time,
+             Phase = c("Total", "Day", "Night", "Twilight")) %>% 
+      select(Phase, Lunges, Time_h = Time, Rate)
+    p <- ggarrange(depth_plot, 
+                   speed_plot,
+                   ggtexttable(rates, rows = NULL, theme = ttheme("blank")),
+                   nrow = 3, ncol = 1, align = "v",
+                   heights = c(3, 3, 2))
+    list(p, rates)
+  }, error = function(e) {
+    p <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+      geom_point()
+    rates <- tibble(Phase = numeric(0), Lunges = numeric(0), Time_h = numeric(0), Rate = numeric(0))
+    list(p, rates)
+  })
+  ggsave(sprintf("figs/qa/lunge_rates_DTAG/%s.pdf", keys$ID),
+         p,
+         height = 11,
+         width = 8.5)
+  rates
+}
+lunge_rates <- lunges %>% 
+  left_join(select(deployments, ID, prh_path, duration_h, daylight_h, night_h,
+                   twilight_h, tag_tz, longitude, latitude, tagon, tagoff), by = "ID") %>% 
+  group_by(ID) %>% 
+  group_modify(lunge_rate_by_solar) %>% 
+  pivot_wider(names_from = Phase, 
+              values_from = c("Lunges", "Time_h", "Rate"))
+
+save(lunge_rates, lunge_rate_summ, weighted.var, file = "data/outputs/CATS_lunges/rates.RData")
+```
+

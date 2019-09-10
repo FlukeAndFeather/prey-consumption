@@ -1,0 +1,560 @@
+---
+title: "CATS lunges"
+output:
+  html_document:
+    df_print: paged
+---
+
+Lunge rates of tagged whales by species, region, and prey type.
+
+```{r setup, echo = FALSE, message = FALSE}
+library(datetimeutils)
+library(ggpubr)
+library(kableExtra)
+library(knitr)
+library(lubridate)
+library(oce)
+library(R.matlab)
+library(readxl)
+library(RcppRoll)
+# Using the dev version of tidyr to use unnest_wider and unnest_longer
+library(tidyverse)
+
+opts_knit$set(root.dir = "..")
+opts_chunk$set(echo = FALSE, message = FALSE, cache = TRUE)
+```
+
+# Tag guide summary
+
+For the four species of interest, broken out by general prey type and region, how many deployments do we have? (Filtered down to just deployments with PRHs.)
+
+* There are 5 Antarctic humpback with unknown prey. All krill?
+* There are 3 blue whales with unknown prey. All krill?
+```{r tag_guide}
+fish_sp <- c("Sardines", "Sand Lance", "Anchovies", "Herring")
+natl_areas <- c("Stellwagen", "Azores", "Greenland", "Norway")
+npac_areas <- c("Monterey", "Cordell Bank", "SoCal", "San Diego", "WA Coast")
+tag_guide1 <- readxl::read_xlsx("/Volumes/COPYCATSdat/CATS/TAG GUIDE.xlsx", skip = 2) %>% 
+  rename(species = `Spec      _`,
+         study_area = `Study_Area     _`,
+         prey_specific = Prey,
+         has_prh = `PRH _`,
+         feed = `Feed _`) %>% 
+  drop_na(ID) %>% 
+  filter(species %in% c('bb', 'bp', 'bw', 'mn'),
+         has_prh == "Y") %>% 
+  mutate(tag_tz = sprintf("Etc/GMT%+d", -`UTC         _`),
+         prey_general = case_when(str_detect(prey_specific, "Krill") ~ "Krill",
+                                  str_detect(prey_specific, "Fish") ~ "Fish",
+                                  prey_specific %in% fish_sp ~ "Fish",
+                                  TRUE ~ "Unknown"),
+         region = case_when(study_area == "Antarctic" ~ "Antarctic",
+                            study_area %in% natl_areas ~ "N Atlantic",
+                            study_area == "South Africa" ~ "S Atlantic",
+                            study_area %in% npac_areas ~ "N Pacific",
+                            TRUE ~ "Other"),
+         longitude = parse_number(`Long_On    _`),
+         latitude = parse_number(`Lat_On    _`),
+         # fix one Antarctic deployment,
+         longitude = if_else(ID %in% c("mn170220-30", "mn170322-30"), -62, longitude),
+         latitude = if_else(ID %in% c("mn170220-30", "mn170322-30"), -64, latitude))
+
+count(tag_guide1, species, region, prey_general) %>% 
+  spread(region, n) %>% 
+  mutate_all(function(x) replace_na(x, 0)) %>% 
+  mutate(total = rowSums(select_if(., is.numeric))) %>% 
+  kable %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+# Lunge files
+
+Almost all deployments have lunge files. One deployments (mn170908-44) has two. I'll use the version with lunge confidence ratings. 14 deployments don't have lunge files. Details on those below. I think they're safe to ignore. One deployment is missing a PRH (remember - these are just deployments that, according to the tag guide, have PRHs). It's a 2018 HRM mn from Monterey. Still investigating what's going on there.
+```{r has_lunges}
+cats_path <- "/Volumes/COPYCATSdat/CATS/tag_data"
+find_lunges <- function(ID) {
+  lunge_paths <- dir(file.path(cats_path, "prhlunges"),
+                     full.names = TRUE) 
+  find_lunge <- function(ID) {
+    idx <- which(str_detect(lunge_paths, ID))
+    # There are two lunge files for this deployment, use the first one
+    if (ID == "mn170908-44")
+      lunge_paths[idx[1]]
+    else if (length(idx) == 1)
+      lunge_paths[idx]
+    else if (length(idx) > 1)
+      "MULTIPLE"
+    else
+      "NONE"
+  }
+  map_chr(ID, find_lunge)
+}
+
+find_prhs <- function(ID) {
+  prh_paths <- dir(file.path(cats_path, "prh"),
+                     full.names = TRUE) 
+  find_prh <- function(ID) {
+    idx <- which(str_detect(prh_paths, ID))
+    if (length(idx) == 1)
+      prh_paths[idx]
+    else if (length(idx) > 1)
+      "MULTIPLE"
+    else
+      "NONE"
+  }
+  map_chr(ID, find_prh)
+}
+
+tag_guide2 <- tag_guide1 %>% 
+  mutate(lunge_path = find_lunges(ID),
+         prh_path = find_prhs(ID))
+```
+
+```{r}
+# Deployments without lunges
+filter(tag_guide2, lunge_path == "NONE") %>%
+  select(ID, Prey = prey_general, Notes, `PRH Notes` = PRH_Notes) %>% 
+  kable(caption = "Deployments without lunges") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                fixed_thead = TRUE) %>% 
+  column_spec(1, width = "8em") %>% 
+  column_spec(2, width = "5em")
+```
+
+```{r}
+# Deployment without PRH
+filter(tag_guide2, prh_path == "NONE") %>%
+  select(ID, Prey = prey_general, Notes, `PRH Notes` = PRH_Notes) %>% 
+  kable(caption = "Deployment without PRH") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed")) %>% 
+  column_spec(1, width = "8em") %>% 
+  column_spec(2, width = "5em")
+```
+
+How many lunges per deployment?
+```{r}
+find_lunges <- function(path) {
+  tryCatch(
+    lunge_mat <- readMat(path),
+    error = function(e) browser()
+  )
+  # Paolo-style lunge files
+  if (is.null(lunge_mat$LungeC))
+    list(lunge_fmt = "PYTHON",
+         total_lunges = length(lunge_mat$LungeI),
+         valid_lunges = NA)
+  # Newer MATLAB lunge files
+  else
+    list(lunge_fmt = "MATLAB",
+         total_lunges = length(lunge_mat$LungeI),
+         valid_lunges = sum(lunge_mat$LungeC > 1))
+}
+tag_guide3 <- filter(tag_guide2, lunge_path != "NONE") %>% 
+  mutate(lunge_info = map(lunge_path, find_lunges)) %>% 
+  unnest_wider(lunge_info) %>% 
+  mutate(percent_valid = if_else(total_lunges > 0, 
+                                 valid_lunges / total_lunges, 
+                                 NA_real_))
+```
+
+```{r}
+mutate(tag_guide3, zero_lunges = total_lunges == 0) %>% 
+  ggplot(aes(x = species, fill = zero_lunges)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(type = "qual", palette = 3) +
+  labs(title = "Percent of deployments with 0 lunges") +
+  theme_minimal() +
+  theme(axis.title = element_blank(),
+        legend.position = "none")
+```
+
+```{r}
+percent_75_over_10 <- tag_guide3 %>% 
+  drop_na(total_lunges, percent_valid) %>% 
+  count(lunge = total_lunges > 10, valid = percent_valid > 0.75) %>% 
+  group_by(lunge) %>% 
+  summarize(percent = n[valid] / sum(n))
+
+tag_guide3 %>% 
+  drop_na(total_lunges, percent_valid) %>% 
+  ggplot(aes(total_lunges, percent_valid)) +
+  geom_point(size = 0.5) +
+  geom_vline(xintercept = 10, linetype = "dashed") +
+  geom_hline(yintercept = 0.75, linetype = "dashed") +
+  scale_x_log10() +
+  labs(x = "Total lunges (log scale)",
+       y = "Percent valid",
+       title = "95.7% of deployments with > 10 lunges are at least 75% valid",
+       caption = "MATLAB-style lunge MATs only") +
+  theme_minimal()
+```
+
+There are 15 deployments with no "feed" (according to the tag guide). Conversely, 16 deployments with "feed" but no lunges. The "no feed" with more than 1 or 2 lunges are probably worth including. **Can someone check this against Shirel's list?**
+```{r}
+tag_guide3 %>%
+  count(feed, has_lunges = total_lunges > 0) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE)
+
+tag_guide3 %>% 
+  filter(feed == "N", 
+         total_lunges > 0) %>%
+  arrange(total_lunges) %>% 
+  select(ID, species, feed, total_lunges, Notes, PRH_Notes) %>% 
+  kable(caption = "No feeding in tag guide, but lunges recorded") %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                fixed_thead = TRUE)
+
+tag_guide3 %>% 
+  filter(feed == "Y", 
+         total_lunges == 0) %>%
+  arrange(total_lunges) %>% 
+  select(ID, species, feed, total_lunges, Notes, PRH_Notes) %>% 
+  kable(caption = "Feeding in tag guide, but no lunges") %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                fixed_thead = TRUE)
+```
+
+# Deployment durations
+
+The tag on/off times in the tag guide aren't always 100% accurate, so it's safest to check the PRH themselves. There are 28 deployments with a discrepancy of a minute or more.
+
+```{r durations}
+# Convert MATLAB DN's to POSIXct
+dn_to_posix <- function(dn, tz = "UTC") {
+  as.POSIXct((dn - 719529) * 86400, origin = "1970-01-01", tz = tz)
+}
+
+# Find tag on/off times
+tag_times_cats <- function(prh_path) {
+  tryCatch({
+    prh <- readMat(prh_path)
+    tagonoff <- dn_to_posix(range(prh$DN[prh$tagon == 1], na.rm = TRUE))
+    list(tagon = tagonoff[1],
+         tagoff = tagonoff[2])
+  }, error = function(e) list(tagon = NA,
+                              tagoff = NA))
+}
+
+tag_guide4 <- tag_guide3 %>% 
+  filter(prh_path != "NONE") %>% 
+  mutate(tagonoff = map(prh_path, tag_times_cats)) %>%  
+  unnest_wider(tagonoff) %>% 
+  mutate_at(vars(tagon, tagoff), ~ force_tzs(.x, tzones = tag_tz)) %>% 
+  mutate(Tag_On = force_tzs(Tag_On, tag_tz),
+         Tag_Off = Tag_Off %>% 
+           parse_number() %>% 
+           convert_date("excel", fraction = TRUE) %>% 
+           force_tzs(tag_tz),
+         tagon_diff = abs(as.numeric(Tag_On - tagon, units = "mins")),
+         tagoff_diff = abs(as.numeric(Tag_Off - tagoff, units = "mins")),
+         duration_h = as.numeric(tagoff - tagon, units = "hours"))
+
+save(tag_guide4, file = "data/outputs/CATS_lunges/tag_guide4.RData")
+```
+
+```{r}
+load("data/outputs/CATS_lunges/tag_guide4.RData")
+filter(tag_guide4, tagon_diff > 1 | tagoff_diff > 1) %>% 
+  select(ID, 
+         `Guide tag on` = Tag_On, 
+         `Guide tag off` = Tag_Off, 
+         `PRH tag on` = tagon, 
+         `PRH tag off` = tagoff, 
+         `Tag on diff` = tagon_diff, 
+         `Tag off diff` = tagoff_diff) %>% 
+  kable(caption = "Deployments with >1 minute difference between tag guide and PRH") %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                fixed_thead = TRUE)
+```
+
+Lunge rates generally decrease with body size. A few notes: the N Atlantic fin whales were mostly from the Azores and the tags tended to drop off at the first lunge, so they probably should be excluded. But there's one 28 hr deployment on a fin from Greenland that looks like good quality. The blue whales from Other are all from the Chile project and should be excluded. The S Atlantic humpbacks are mostly from the super group work I think, but their lunge rates don't seem significantly higher than the Antarctic individuals.
+
+```{r}
+tag_guide4 %>% 
+  filter(prey_general == "Krill") %>% 
+  mutate(lunges_h = total_lunges / duration_h,
+         species = factor(species, levels = c("bb", "mn", "bp", "bw"))) %>% 
+  ggplot(aes(x = species, y = lunges_h, fill = region)) +
+  geom_boxplot() +
+  geom_text(aes(x = species, y = -5, group = region, label = n),
+            tag_guide4 %>% 
+              filter(prey_general == "Krill") %>% 
+              count(species, region),
+            inherit.aes = FALSE,
+            position = position_dodge(width = 0.75)) +
+  labs(y = "Lunges per hour",
+       caption = "Krill feeders only") +
+  theme_minimal() +
+  theme(axis.title.x = element_blank())
+
+tag_guide4 %>% 
+  filter(prey_general == "Krill") %>% 
+  count(species, region) %>% 
+  kable(caption = "Krill-feeder sample sizes by species and region") %>% 
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                fixed_thead = TRUE)
+```
+
+# Day/night lunge rates
+```{r lunge_times}
+lunge_times <- function(prh_path, lunge_path) {
+  lunge_mat <- readMat(lunge_path)
+  # Paolo-style lunge files
+  if (is.null(lunge_mat$LungeC)) {
+    prh_mat <- readMat(prh_path)
+    dn_to_posix(prh_mat$DN[lunge_mat$LungeI])
+  }
+  # Newer MATLAB lunge files
+  else {
+    dn_to_posix(lunge_mat$LungeDN)
+  }
+}
+
+## MATT: This is the function to find lunge depths
+# lunge_depths <- function(prh_path, lunge_path) {
+#   lunge_mat <- readMat(lunge_path)
+#   prh_mat <- readMat(prh_path)
+#   prh_mat$p[lunge_mat$LungeI]
+# }
+
+lunges <- tag_guide4 %>%
+  mutate(lunge_time = map2(prh_path, lunge_path, lunge_times)) %>% 
+  unnest(lunge_time) %>%
+  mutate(lunge_time = force_tzs(lunge_time, tag_tz)) %>% 
+  ## MATT: This is how you use the lunge depth function
+  # mutate(lunge_depth = map2(prh_path, lunge_path, lunge_depths)) %>% 
+  # unnest(lunge_depths) %>% 
+  select(ID, species, lunge_time, longitude, latitude)
+
+save(lunges, file = "data/outputs/CATS_lunges/lunges.RData")
+```
+
+For krill feeders, 
+
+```{r lunge_sun}
+sun_phase <- function(x, y, t) {
+  alt <- sunAngle(t, longitude = x, latitude = y)$altitude
+  cut(alt, c(-Inf, -18, 0, Inf), labels = c("NIGHT", "TWILIGHT", "DAY"))
+}
+lunges2 <- lunges %>% 
+  drop_na(longitude, latitude, lunge_time) %>% 
+  mutate(lunge_sun = sun_phase(x = longitude, y = latitude, t = lunge_time))
+
+daylight_fun <- function(start, end, lon, lat, n = 1e3) {
+  pmap_dbl(list(start, end, lon, lat), 
+           function(start, end, lon, lat) {
+             if(is.na(lon) || is.na(lat)) {
+               NA
+             } else {
+               angle <- sunAngle(seq(start, end, length.out = n), lon, lat)$altitude 
+               as.numeric(end - start, units = "hours") * sum(angle > 0) / n
+             }
+           })
+}
+twilight_fun <- function(start, end, lon, lat, n = 1e3) {
+  pmap_dbl(list(start, end, lon, lat), 
+           function(start, end, lon, lat) {
+             if(is.na(lon) || is.na(lat)) {
+               NA
+             } else {
+               angle <- sunAngle(seq(start, end, length.out = n), lon, lat)$altitude 
+               as.numeric(end - start, units = "hours") * sum(angle >= -18 & angle <= 0) / n
+             }
+           })
+}
+night_fun <- function(start, end, lon, lat, n = 1e3) {
+  pmap_dbl(list(start, end, lon, lat), 
+           function(start, end, lon, lat) {
+             if(is.na(lon) || is.na(lat)) {
+               NA
+             } else {
+               angle <- sunAngle(seq(start, end, length.out = n), lon, lat)$altitude 
+               as.numeric(end - start, units = "hours") * sum(angle < -18) / n
+             }
+           })
+}
+tag_guide5 <- mutate(tag_guide4, 
+                     longitude = parse_number(`Long_On    _`),
+                     latitude = parse_number(`Lat_On    _`),
+                     # fix one Antarctic deployment,
+                     longitude = if_else(ID %in% c("mn170220-30", "mn170322-30"), -62, longitude),
+                     latitude = if_else(ID %in% c("mn170220-30", "mn170322-30"), -64, latitude)) %>% 
+  drop_na(tagon, tagoff) %>% 
+  mutate(daylight_h = daylight_fun(tagon, tagoff, longitude, latitude),
+         night_h = night_fun(tagon, tagoff, longitude, latitude),
+         twilight_h = twilight_fun(tagon, tagoff, longitude, latitude))
+```
+
+```{r}
+lunges_deploy <- lunges2 %>% 
+  group_by(ID) %>% 
+  summarize(total_lunges = n(),
+            day_lunges = sum(lunge_sun == "DAY"),
+            twilight_lunges = sum(lunge_sun == "TWILIGHT"),
+            night_lunges = sum(lunge_sun == "NIGHT")) %>% 
+  left_join(select(tag_guide5, ID, species, region, prey_general,
+                   total_hours = duration_h,
+                   day_hours = daylight_h,
+                   night_hours = night_h),
+            by = "ID") %>% 
+  drop_na(species) %>% 
+  filter(prey_general == "Krill")
+
+lunges_deploy %>% 
+  group_by(species, region) %>% 
+  summarize(day_lunges_h = sum(day_lunges) / sum(day_hours),
+            night_lunges_h = sum(night_lunges) / sum(night_hours),
+            N = n_distinct(ID)) %>% 
+  ungroup %>% 
+  kable %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+# Quality assurance
+
+Plots of depth + speed w/ lunges, color coded by day/night/twilight and a table of lunge counts, duration, and lunge rate by day/night/twilight. See *figs/qa/lunge_rates*.
+```{r qa_lungerates}
+# This function creates the QA plots (with depth, speed, lunges, and day phase)
+lunge_rate_by_solar <- function(rows, keys) {
+  tryCatch({
+    prh <- readMat(rows$prh_path[1])
+    speed <- dir('data/speeds', keys$ID, full.names = TRUE) %>% 
+      readLines %>% 
+      parse_number %>% 
+      roll_mean(n = 10, fill = NA)
+    lon <- mean(rows$longitude)
+    lat <- mean(rows$latitude)
+    n_hours <- 6
+    plot_data <- tibble(datetime = dn_to_posix(prh$DN) %>% 
+                          force_tz(rows$tag_tz[1]),
+                        depth = prh$p,
+                        speed) %>% 
+      mutate(sunalt = sunAngle(datetime, lon, lat)$altitude) %>% 
+      left_join(transmute(rows, datetime = lunge_time, lunge_time), 
+                 by = "datetime") %>% 
+      mutate_at(vars(datetime, lunge_time), ~ with_tz(.x, rows$tag_tz[1]))
+    solar <- plot_data %>% 
+      mutate(phase = case_when(sunalt < -18 ~ "NIGHT",
+                               sunalt < 0   ~ "TWILIGHT",
+                               sunalt >= 0  ~ "DAY") %>% 
+               factor(levels = c("NIGHT", "TWILIGHT", "DAY")),
+             phaseid = cumsum(phase != lag(phase, default = first(phase)))) %>% 
+      group_by(phase, phaseid) %>% 
+      summarize(start = first(datetime)) %>% 
+      ungroup %>% 
+      arrange(phaseid) %>% 
+      mutate(end = lead(start, default = last(plot_data$datetime)))
+    solarpal <- c(DAY = rgb(86, 180, 233, maxColorValue = 255), # sky blue
+                  TWILIGHT = rgb(213, 94, 0, maxColorValue = 255), # vermillion
+                  NIGHT = rgb(0, 158, 115, maxColorValue = 255)) # bluish green
+    depth_plot <- ggplot(plot_data, aes(datetime, depth)) +
+      geom_rect(aes(xmin = start, 
+                    xmax = end, 
+                    ymin = min(plot_data$depth, na.rm = TRUE),
+                    ymax = max(plot_data$depth, na.rm = TRUE),
+                    fill = phase),
+                solar,
+                alpha = 0.5,
+                inherit.aes = FALSE) +
+      geom_line(size = 0.1) +
+      geom_point(aes(color = !is.na(lunge_time))) +
+      scale_y_reverse() +
+      scale_color_manual(values = c("#00000000", "red")) +
+      scale_fill_manual(values = solarpal) +
+      labs(title = keys$ID,
+           y = "Depth (m)") +
+      theme_classic() +
+      theme(legend.position = "none",
+            axis.title.x = element_blank(),
+            axis.text.x = element_blank())
+    speed_plot <- ggplot(plot_data, aes(datetime, speed)) +
+      geom_line(size = 0.1) +
+      geom_point(aes(color = !is.na(lunge_time))) +
+      scale_color_manual(values = c("#00000000", "red")) +
+      labs(x = "Local time",
+           y = "Speed (m/s)") +
+      theme_classic() +
+      theme(legend.position = "none")
+    lunging <- summarize(rows, 
+                         l = n(),
+                         ld = sum(lunge_sun == "DAY"),
+                         ln = sum(lunge_sun == "NIGHT"),
+                         lt = sum(lunge_sun == "TWILIGHT")) %>% 
+      gather(lvar, Lunges, l:lt)
+    durs <- tibble(t = rows$duration_h[1],
+                   td = rows$daylight_h[1],
+                   tn = rows$night_h[1],
+                   tt = rows$twilight_h[1]) %>% 
+      gather(tvar, Time, t:tt)
+    rates <- cbind(lunging, durs) %>% 
+      mutate(Rate = Lunges / Time,
+             Phase = c("Total", "Day", "Night", "Twilight")) %>% 
+      select(Phase, Lunges, `Time (hours)` = Time, Rate)
+    p <- ggarrange(depth_plot, 
+                   speed_plot,
+                   ggtexttable(rates, rows = NULL, theme = ttheme("blank")),
+                   nrow = 3, ncol = 1, align = "v",
+                   heights = c(3, 3, 2))
+  }, error = function(e) {
+    p <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
+      geom_point()
+  })
+  ggsave(sprintf("figs/qa/lunge_rates/%s.pdf", keys$ID),
+         p,
+         height = 11,
+         width = 8.5)
+  rates
+}
+
+# This runs the QA plots function for each deployment and calculates the lunge rates
+lunge_rates <- lunges2 %>% 
+  left_join(select(tag_guide5, ID, prh_path, duration_h, daylight_h, night_h,
+                   twilight_h, tag_tz, prey_general), by = "ID") %>% 
+  group_by(ID, prey_general) %>% 
+  group_modify(lunge_rate_by_solar)
+
+# This is a summary plot of all the lunge rates
+lunge_rates %>% 
+  left_join(select(tag_guide5, ID, species, region)) %>% 
+  mutate(zone = if_else(region == "Antarctic", "Polar", "Temperate"),
+         Phase = factor(Phase, levels = c("Total", "Day", "Twilight", "Night"))) %>% 
+  filter(prey_general %in% c("Fish", "Krill")) %>% 
+  ggplot(aes(x = species, y = Rate, color = Phase)) +
+  geom_boxplot() +
+  scale_color_manual(values = cbf_pal) +
+  facet_grid(prey_general ~ zone,
+             scales = "free_y") +
+  theme_minimal()
+
+# This is a function to calculate the weighted variance of the lunge rates
+weighted.var <- function(x, w) {
+  valid <- is.finite(x) & is.finite(w)
+  x <- x[valid]
+  w <- w[valid]
+  v1 <- sum(w)
+  v2 <- sum(w^2)
+  mu <- weighted.mean(x, w)
+  (v1 / (v1^2 - v2)) * sum(w * (x - mu)^2)
+}
+
+# This is the summary table
+lunge_rate_summ <- lunge_rates %>% 
+  left_join(select(tag_guide5, ID, species, region)) %>% 
+  mutate(zone = if_else(region == "Antarctic", "Polar", "Temperate"),
+         Phase = factor(Phase, levels = c("Total", "Day", "Twilight", "Night"))) %>% 
+  filter(prey_general %in% c("Fish", "Krill")) %>% 
+  rename(duration = `Time (hours)`) %>% 
+  group_by(species, prey_general, zone, Phase) %>% 
+  summarize(rate_mean = weighted.mean(Rate, duration),
+            rate_sd = sqrt(weighted.var(Rate, duration))) %>% 
+  drop_na(rate_mean, rate_sd) %>% 
+  pivot_wider(names_from = Phase, values_from = rate_mean:rate_sd) %>% 
+  select(species:zone, ends_with("Total"), ends_with("Day"), 
+         ends_with("Twilight"), ends_with("Night"))
+
+# Here are all the outputs
+save(lunge_rates, lunge_rate_summ, weighted.var, file = "data/outputs/CATS_lunges/rates.RData")
+```
