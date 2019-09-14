@@ -232,7 +232,8 @@ lunge_rate_by_solar <- function(rows, keys) {
                        depth = prh$p,
                        speed) %>% 
       slice(seq(1, length(DN), length.out = 1e4)) %>% 
-      mutate(sunalt = sunAngle(datetime, lon, lat)$altitude)
+      mutate(sunalt = sunAngle(datetime, lon, lat)$altitude) %>% 
+      filter(between(datetime, first(rows$tagon), first(rows$tagoff)))
     rows2 <- mutate(rows, 
                     datetime = lunge_time,
                     i = findInterval(lunge_time, prh_data$datetime),
@@ -288,11 +289,11 @@ lunge_rate_by_solar <- function(rows, keys) {
                    td = rows$daylight_h[1],
                    tn = rows$night_h[1],
                    tt = rows$twilight_h[1]) %>% 
-      gather(tvar, Time, t:tt)
+      gather(tvar, Hours, t:tt)
     rates <- cbind(lunging, durs) %>% 
-      mutate(Rate = Lunges / Time,
+      mutate(Rate = Lunges / Hours,
              Phase = c("Total", "Day", "Night", "Twilight")) %>% 
-      select(Phase, Lunges, Time_h = Time, Rate)
+      select(Phase, Lunges, Hours, Rate)
     p <- ggarrange(depth_plot, 
                    speed_plot,
                    ggtexttable(rates, rows = NULL, theme = ttheme("blank")),
@@ -302,7 +303,7 @@ lunge_rate_by_solar <- function(rows, keys) {
   }, error = function(e) {
     p <- ggplot(data.frame(x = 1, y = 1), aes(x, y)) + 
       geom_point()
-    rates <- tibble(Phase = numeric(0), Lunges = numeric(0), Time_h = numeric(0), Rate = numeric(0))
+    rates <- tibble(Phase = numeric(0), Lunges = numeric(0), Hours = numeric(0), Rate = numeric(0))
     list(p, rates)
   })
   ggsave(sprintf("figs/qa/lunge_rates_DTAG/%s.pdf", keys$ID),
@@ -311,14 +312,57 @@ lunge_rate_by_solar <- function(rows, keys) {
          width = 8.5)
   rates
 }
-lunge_rates <- lunges %>% 
+
+# FOR DEBUGGING
+# id <- "bw10_244c"
+# data <- lunges %>%
+#   left_join(select(deployments, ID, prh_path, duration_h, daylight_h, night_h,
+#                    twilight_h, tag_tz, longitude, latitude, tagon, tagoff), by = "ID")
+# rows <- filter(data, ID == id)
+# keys <- select(rows, ID) %>% slice(1)
+# lunge_rate_by_solar(rows, keys)
+
+# Calculate rates and make QA/QC plots
+lunges_long <- lunges %>% 
   left_join(select(deployments, ID, prh_path, duration_h, daylight_h, night_h,
                    twilight_h, tag_tz, longitude, latitude, tagon, tagoff), by = "ID") %>% 
   group_by(ID) %>% 
-  group_modify(lunge_rate_by_solar) %>% 
-  pivot_wider(names_from = Phase, 
-              values_from = c("Lunges", "Time_h", "Rate"))
+  group_modify(lunge_rate_by_solar) 
 
-save(lunge_rates, lunge_rate_summ, weighted.var, file = "data/outputs/CATS_lunges/rates.RData")
+lunge_rates <- lunges_long %>% 
+  pivot_wider(names_from = Phase, 
+              values_from = c("Lunges", "Hours", "Rate"))
+
+# This is a function to calculate the weighted variance of the lunge rates
+weighted.var <- function(x, w) {
+  valid <- is.finite(x) & is.finite(w)
+  x <- x[valid]
+  w <- w[valid]
+  v1 <- sum(w)
+  v2 <- sum(w^2)
+  mu <- weighted.mean(x, w)
+  (v1 / (v1^2 - v2)) * sum(w * (x - mu)^2)
+}
+weighted.sd <- function(x, w) {
+  sqrt(weighted.var(x, w))
+}
+
+# This is the summary table
+dep_summ <- deployments %>% 
+  group_by(species) %>% 
+  summarize(Hours = sum(duration_h, na.rm = TRUE),
+            N = n())
+lunge_rate_summ <- lunges_long %>% 
+  left_join(select(deployments, ID, species)) %>% 
+  group_by(species, Phase) %>% 
+  summarize(Rate_mean = weighted.mean(Rate, Hours),
+            Rate_sd = sqrt(weighted.var(Rate, Hours))) %>% 
+  drop_na(Rate_mean, Rate_sd) %>% 
+  pivot_wider(names_from = Phase, values_from = Rate_mean:Rate_sd) %>% 
+  left_join(dep_summ, by = "species") %>%
+  select(species, N, Hours, ends_with("Total"), ends_with("Day"), 
+         ends_with("Twilight"), ends_with("Night"))
+  
+save(lunge_rates, lunge_rate_summ, weighted.var, file = "data/outputs/DTAG_lunges/rates.RData")
 ```
 
