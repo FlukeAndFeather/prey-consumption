@@ -323,13 +323,13 @@ lunge_rate_by_solar <- function(rows, keys) {
 # lunge_rate_by_solar(rows, keys)
 
 # Calculate rates and make QA/QC plots
-lunges_long <- lunges %>% 
+dtag_lunges_long <- lunges %>% 
   left_join(select(deployments, ID, prh_path, duration_h, daylight_h, night_h,
                    twilight_h, tag_tz, longitude, latitude, tagon, tagoff), by = "ID") %>% 
   group_by(ID) %>% 
   group_modify(lunge_rate_by_solar) 
 
-lunge_rates <- lunges_long %>% 
+dtag_lunges_wide <- dtag_lunges_long %>% 
   pivot_wider(names_from = Phase, 
               values_from = c("Lunges", "Hours", "Rate"))
 
@@ -352,7 +352,7 @@ dep_summ <- deployments %>%
   group_by(species) %>% 
   summarize(Hours = sum(duration_h, na.rm = TRUE),
             N = n())
-lunge_rate_summ <- lunges_long %>% 
+dtag_summ <- dtag_lunges_long %>% 
   left_join(select(deployments, ID, species)) %>% 
   group_by(species, Phase) %>% 
   summarize(Rate_mean = weighted.mean(Rate, Hours),
@@ -363,6 +363,6 @@ lunge_rate_summ <- lunges_long %>%
   select(species, N, Hours, ends_with("Total"), ends_with("Day"), 
          ends_with("Twilight"), ends_with("Night"))
   
-save(lunge_rates, lunge_rate_summ, weighted.var, file = "data/outputs/DTAG_lunges/rates.RData")
+save(dtag_lunges_long, dtag_lunges_wide, dtag_summ, weighted.var, file = "data/outputs/DTAG_lunges/rates.RData")
 ```
 
