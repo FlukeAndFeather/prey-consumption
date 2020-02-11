@@ -1,0 +1,120 @@
+---
+title: "Balaenid consumption"
+author: "Max Czapanskiy"
+date: "2/3/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+root <- rprojroot::find_rstudio_root_file()
+```
+
+## Balaenid consumption
+
+Data for balaenids are limited. We'll keep estimates of daily feeding rates (kg/day) conservative by assuming only daytime feeding.
+
+```{r load_data}
+balaenid_spec <- tribble(
+  ~colname,           ~coltype,
+  "whale_id",         "c",
+  "common_name",      "c",
+  "dive_num",         "n",
+  "fs",               "n",
+  "n_indices",        "n",
+  "dur_s",            "n",
+  "deploy_start_lcl", "c",
+  "deploy_end_lcl",   "c",
+  "dive_start_idx",   "n",
+  "dive_start_sec",   "n",
+  "dive_start_lcl",   "c",
+  "dive_end_idx",     "n",
+  "dive_end_lcl",     "c",
+  "dive_time_idx",    "n",
+  "dive_time_sec",    "n",
+  "desc_sec",         "n",
+  "bott_sec",         "n",
+  "asc_sec",          "n",
+  "fluking_perc",     "n",
+  "nonfluking_perc",  "n",
+  "maxdepth",         "n",
+  "meandepth",        "n",
+  "bott_flk_perc",    "n",
+  "bott_nonflk_perc", "n",
+  "stroke_freq",      "n",
+  "bott_stroke_freq", "n",
+  "gape_area",        "n",
+  "post_open",        "n",
+  "speed",            "n",
+  "press_diff",       "n",
+  "vol_flow",         "n",
+  "vol_per_day",      "n"
+)
+balaenid <- file.path(root, "data/Balaenid Dive Info For Matt_final.csv") %>% 
+  read_csv(col_names = balaenid_spec$colname,
+           col_types = paste(balaenid_spec$coltype, collapse = ""),
+           skip = 1,
+           na = "NaN")
+balaenid %>% 
+  group_by(common_name, whale_id) %>% 
+  summarize(dur_h = first(dur_s) / 3600,
+            n_dives = n()) %>% 
+  ungroup()
+```
+
+For each deployment: % time diving, % time at bottom, % time fluking.
+
+```{r feeding}
+balaenid_feeding <- balaenid %>% 
+  select(common_name, 
+         whale_id, 
+         dur_s,
+         dive_time_sec,
+         bott_sec,
+         bott_flk_perc,
+         vol_flow) %>% 
+  mutate(V = bott_flk_perc/100 * bott_sec * vol_flow) %>% 
+  group_by(common_name, whale_id) %>% 
+  summarize(dur_h = first(dur_s) / 3600,
+            n_dive = n(),
+            total_h2o = sum(V),
+            h2o_hr = total_h2o / dur_h) %>% 
+  ungroup()
+
+ggplot(balaenid_feeding, aes(dur_h, h2o_hr, color = common_name)) +
+  geom_point() +
+  labs(x = "Deployment duration (hours)") +
+  scale_y_continuous("Filtration rate (m^3 H2O / hour)") +
+  scale_color_manual(values = c("#4304ff", "#ff9f04")) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.title = element_blank())
+```
+
+```{r hourly_rate} 
+n_iter <- 1e3
+balaenid_sampled <- balaenid_feeding %>% 
+  group_by(common_name) %>% 
+  mutate(norm_dur_h = dur_h / sum(dur_h)) %>% 
+  group_modify(
+    ~ tibble(h2o_hr = sample(.x$h2o_hr, 
+                             n_iter, 
+                             replace = TRUE, 
+                             prob = .x$norm_dur_h)
+    ) 
+  )
+ggplot(balaenid_sampled, aes(common_name, h2o_hr, fill = common_name)) +
+  geom_violin() + 
+  scale_x_discrete("", labels = scales::wrap_format(20)) +
+  scale_y_continuous("Filtration rate (m^3 H2O / hour)",
+                     labels = scales::label_comma()) +
+  scale_fill_manual(values = c("#4304ff", "#ff9f04")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.y = element_blank())
+ggsave(file.path(root, "figs/balaenid/h2o_rate.pdf"),
+       height = 4,
+       width = 4)
+```
