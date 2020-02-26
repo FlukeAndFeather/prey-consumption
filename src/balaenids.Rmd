@@ -100,8 +100,7 @@ balaenid_sampled <- balaenid_feeding %>%
   group_modify(
     ~ tibble(h2o_hr = sample(.x$h2o_hr, 
                              n_iter, 
-                             replace = TRUE, 
-                             prob = .x$norm_dur_h)
+                             replace = TRUE)
     ) 
   )
 ggplot(balaenid_sampled, aes(common_name, h2o_hr, fill = common_name)) +
